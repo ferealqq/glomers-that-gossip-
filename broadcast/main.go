@@ -6,25 +6,17 @@ import (
 	"log"
 	"math"
 	"os"
+	"sync"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
-	cmap "github.com/orcaman/concurrent-map/v2"
 )
-
-// var seenMessages = make(map[float64]bool)
-// var seenMu sync.Mutex
-
-// var queue = make(chan BroadcastMsgs)
-// // list of messages seen by broadcast
-// var queMu sync.Mutex
-// var msgValues = []float64{}
 
 var lg *log.Logger
 var logFile *os.File
-var MAX_RETRY = 10
+var MAX_RETRY = 35
+var TIMEOUT = time.Millisecond * 650
 
-// str => destination
 type BroadcastMsg struct {
 	Payload BroadcastPayload
 	Dst     string
@@ -38,10 +30,9 @@ type BroadcastPayload struct {
 
 type Node struct {
 	*maelstrom.Node
-	queue chan BroadcastMsg
-	// store      map[int]struct{}
-	store cmap.ConcurrentMap[float64, struct{}]
-	// storeMu    sync.RWMutex
+	queue      chan BroadcastMsg
+	store      map[float64]struct{}
+	storeMu    sync.RWMutex
 	neighbours []string
 }
 
@@ -49,18 +40,16 @@ func sharding(key float64) uint32 {
 	return math.Float32bits(float32(key))
 }
 
-func NewNode() *Node {
+func newNode() *Node {
 	return &Node{
-		Node:  maelstrom.NewNode(),
-		queue: make(chan BroadcastMsg),
-		// store:      make(map[int]struct{}),
-		store:      cmap.NewWithCustomShardingFunction[float64, struct{}](sharding),
+		Node:       maelstrom.NewNode(),
+		queue:      make(chan BroadcastMsg),
+		store:      make(map[float64]struct{}),
 		neighbours: nil,
 	}
 }
 
 func (n *Node) broadcastMessage(src string, payload BroadcastPayload) error {
-	lg.Println(n.neighbours)
 	for _, dst := range n.neighbours {
 		if dst == src {
 			continue
@@ -83,6 +72,9 @@ func (n *Node) sendBroadcast() {
 				for i := 0; i < MAX_RETRY; i++ {
 					if node.sendRPC(m) == nil {
 						break
+					} else {
+						time.Sleep(TIMEOUT)
+						continue
 					}
 				}
 			}
@@ -91,18 +83,17 @@ func (n *Node) sendBroadcast() {
 }
 
 func (n *Node) sendRPC(m BroadcastMsg) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*250)
+	ctx, cancel := context.WithTimeout(context.Background(), TIMEOUT)
 	defer cancel()
 	_, err := n.SyncRPC(ctx, m.Dst, m.Payload)
 	return err
 }
 
 // returns a new logger and a new log file in question, remember to close log file after the process exists
+// new logger because the default logging get's too noisy by the maelstorm go library
 func newLogger() (*log.Logger, *os.File) {
-	// because the logging get's too noisy when using with maelstrom
 	fileName := "/tmp/maelstrom.log"
 
-	// open log file
 	logFile, err := os.OpenFile(fileName, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		log.Panic(err)
@@ -114,8 +105,14 @@ func newLogger() (*log.Logger, *os.File) {
 	return lg, logFile
 }
 
-func (n *Node) Keys() []float64 {
-	return n.store.Keys()
+func (n *Node) keys() []float64 {
+	n.storeMu.RLock()
+	keys := make([]float64, 0, len(n.store))
+	for k := range n.store {
+		keys = append(keys, k)
+	}
+	n.storeMu.RUnlock()
+	return keys
 }
 
 func main() {
@@ -125,32 +122,31 @@ func main() {
 	}
 	defer logFile.Close()
 
-	n := NewNode()
+	n := newNode()
 
-	// handle messages to be sent to neighbour nodes
+	// send broadcastmessages to neighbour nodes
 	go n.sendBroadcast()
 
-	// TODO Nodes should only return copies of their own local values?
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		// Unmarshal the message payload as an loosely-typed map.
 		var payload BroadcastPayload
 		if err := json.Unmarshal(msg.Body, &payload); err != nil {
 			return err
 		}
-		// n.storeMu.Lock()
-		if _, ok := n.store.Get(payload.Message); ok {
-			// n.storeMu.Unlock()
+		n.storeMu.Lock()
+		if _, ok := n.store[payload.Message]; ok {
+			n.storeMu.Unlock()
 			return n.Reply(msg, map[string]any{
-				"type": "broadcast_ok",
+				"type":   "broadcast_ok",
+				"msg_id": payload.MsgId,
 			})
 		}
-		n.store.Set(payload.Message, struct{}{})
-		// n.store[val] = struct{}{}
-		// n.storeMu.Unlock()
+		n.store[payload.Message] = struct{}{}
+		n.storeMu.Unlock()
 		if err := n.broadcastMessage(msg.Src, payload); err != nil {
 			return err
 		}
-		// defer n.consumeBroadcast(msg, payload)
+
 		// Echo the original message back with the updated message type.
 		return n.Reply(msg, map[string]any{
 			"type":   "broadcast_ok",
@@ -167,8 +163,7 @@ func main() {
 			body = make(map[string]any)
 		}
 		body["type"] = "read_ok"
-		body["messages"] = n.Keys()
-		// body["messages"] a= n.values.Get()
+		body["messages"] = n.keys()
 
 		return n.Reply(msg, body)
 	})
