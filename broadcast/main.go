@@ -30,10 +30,10 @@ type BroadcastPayload struct {
 
 type Node struct {
 	*maelstrom.Node
-	queue      chan BroadcastMsg
-	store      map[float64]struct{}
-	storeMu    sync.RWMutex
-	neighbours []string
+	queue         chan BroadcastMsg
+	store         map[float64]struct{}
+	storeMu       sync.RWMutex
+	optNeighbours []string // neighbours that doesn't have conflicting neighbours (i.e if neighbour has a same neighbour as I do don't send broadcast, because you'll neighbour will do it)
 }
 
 func sharding(key float64) uint32 {
@@ -42,15 +42,15 @@ func sharding(key float64) uint32 {
 
 func newNode() *Node {
 	return &Node{
-		Node:       maelstrom.NewNode(),
-		queue:      make(chan BroadcastMsg),
-		store:      make(map[float64]struct{}),
-		neighbours: nil,
+		Node:          maelstrom.NewNode(),
+		queue:         make(chan BroadcastMsg),
+		store:         make(map[float64]struct{}),
+		optNeighbours: nil,
 	}
 }
 
 func (n *Node) broadcastMessage(src string, payload BroadcastPayload) error {
-	for _, dst := range n.neighbours {
+	for _, dst := range n.optNeighbours {
 		if dst == src {
 			continue
 		}
@@ -87,6 +87,51 @@ func (n *Node) sendRPC(m BroadcastMsg) error {
 	defer cancel()
 	_, err := n.SyncRPC(ctx, m.Dst, m.Payload)
 	return err
+}
+
+// if neighbour has a same neighbour as I do don't send broadcast, because you'll neighbour will do it
+// call only if node.neighbours has been defined
+func (n *Node) optimzeNeighbours(topology map[string][]string) []string {
+	neighbours := make(map[string]struct{})
+	for _, n := range topology[n.ID()] {
+		neighbours[n] = struct{}{}
+	}
+	delete(topology, n.ID())
+	/**
+	-> our id =
+	topology := map[string][]string{
+		"n0": {"n1", "n2"},
+		"n1": {"n3", "n4"},
+		"n2": {"n1"},
+	}
+	assert.Equal(t, optimizeNeighbours(topology)[0], "n2")
+	assert.Equal(t, len(optimizeNeighbours(topology)), 1)
+	expected result: [n2]
+
+	topology := map[string][]string{
+		"n0": {"n1", "n2"},
+		"n1": {"n2"},
+		"n2": {"n3", "n4"},
+	}
+	assert.Equal(t, optimizeNeighbours(topology)[0], "n1")
+	assert.Equal(t, len(optimizeNeighbours(topology)), 1)
+	expected result: [n1]
+	**/
+	for key, ns := range topology {
+		if _, ok := neighbours[key]; ok {
+			for _, k := range ns {
+				if _, i := neighbours[k]; i {
+					delete(neighbours, k)
+				}
+			}
+		}
+	}
+	neighbourIds := make([]string, 0, len(neighbours))
+	for k := range neighbours {
+		neighbourIds = append(neighbourIds, k)
+	}
+	n.optNeighbours = neighbourIds
+	return neighbourIds
 }
 
 // returns a new logger and a new log file in question, remember to close log file after the process exists
@@ -173,12 +218,19 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		nbrs := body["topology"].(map[string]interface{})[n.ID()]
-		neighbors := []string{}
-		for _, nei := range nbrs.([]interface{}) {
-			neighbors = append(neighbors, nei.(string))
+		lg.Println(body)
+		topoRaw := body["topology"].(map[string]interface{})
+		topology := make(map[string][]string)
+		for key, ns := range topoRaw {
+			for _, s := range ns.([]interface{}) {
+				if topology[key] == nil {
+					topology[key] = []string{s.(string)}
+				} else {
+					topology[key] = append(topology[key], s.(string))
+				}
+			}
 		}
-		n.neighbours = neighbors
+		n.optimzeNeighbours(topology)
 
 		return n.Reply(msg, map[string]string{
 			"type": "topology_ok",
