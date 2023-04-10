@@ -1,17 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"math"
 	"os"
-	"sync"
-	"sync/atomic"
-	"unsafe"
-
-	cmap "github.com/orcaman/concurrent-map/v2"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+	cmap "github.com/orcaman/concurrent-map/v2"
 )
 
 // var seenMessages = make(map[float64]bool)
@@ -24,11 +22,13 @@ import (
 
 var lg *log.Logger
 var logFile *os.File
-var sent = 0
-var shouldSend = 0
+var MAX_RETRY = 10
 
 // str => destination
-type BroadcastMsgs = map[string]BroadcastPayload
+type BroadcastMsg struct {
+	Payload BroadcastPayload
+	Dst     string
+}
 
 type BroadcastPayload struct {
 	MsgType string  `json:"type"`
@@ -38,26 +38,11 @@ type BroadcastPayload struct {
 
 type Node struct {
 	*maelstrom.Node
-	queMu sync.Mutex
-	queue chan *BroadcastMsgs
-	// seen map[float64]bool
-	// seen   *sync.Map
-	seen       cmap.ConcurrentMap[float64, bool]
-	seenMu     sync.RWMutex
-	values     *AtomicSlice
-	neighbours *[]string
-}
-
-type AtomicSlice struct {
-	value unsafe.Pointer
-}
-
-func NewAtomicSlice(slice []int) *AtomicSlice {
-	return &AtomicSlice{value: unsafe.Pointer(&slice)}
-}
-
-func (s *AtomicSlice) Get() []int {
-	return *(*[]int)(atomic.LoadPointer(&s.value))
+	queue chan BroadcastMsg
+	// store      map[int]struct{}
+	store cmap.ConcurrentMap[float64, struct{}]
+	// storeMu    sync.RWMutex
+	neighbours []string
 }
 
 func sharding(key float64) uint32 {
@@ -67,96 +52,55 @@ func sharding(key float64) uint32 {
 func NewNode() *Node {
 	return &Node{
 		Node:  maelstrom.NewNode(),
-		queue: make(chan *BroadcastMsgs),
-		// seen:   make(map[float64]bool),
-		seen:       cmap.NewWithCustomShardingFunction[float64, bool](sharding),
-		values:     NewAtomicSlice([]int{}),
+		queue: make(chan BroadcastMsg),
+		// store:      make(map[int]struct{}),
+		store:      cmap.NewWithCustomShardingFunction[float64, struct{}](sharding),
 		neighbours: nil,
 	}
 }
 
-func (n *Node) consumeBroadcast(msg maelstrom.Message, payload BroadcastPayload) {
-	// n.seenMu.RLock()
-	val := payload.Message
-	// if a value has not been seen send the values to neighbouring nodes and save the seen message to the list
-	if l, _ := n.seen.Get(val); l == false {
-		// lg.Println(n.seen.Keys())
-		n.seen.Set(val, true)
-		// currentNumbers := n.values.Get()
-		// newNumbers := append(currentNumbers, int(val))
-		// atomic.StorePointer(&n.values.value, unsafe.Pointer(&newNumbers))
-
-		send := make(BroadcastMsgs)
-		for _, i := range n.getNeighbours() {
-			if i == msg.Src {
-				if i == msg.Src {
-					lg.Printf(" dst == msg.Src %s \n", i)
-				}
-				continue
-			}
-			send[i] = payload
-			// if sending failes try to resend
-			// if n.RPC(i, payload, func(msg maelstrom.Message) error {
-			// 	// our attention is not required
-			// 	return nil
-			// }) != nil {
-			// 	send[i] = payload
-			// }
+func (n *Node) broadcastMessage(src string, payload BroadcastPayload) error {
+	lg.Println(n.neighbours)
+	for _, dst := range n.neighbours {
+		if dst == src {
+			continue
 		}
-		if len(send) > 0 {
-			n.queMu.Lock()
-			n.queue <- &send
-			defer n.queMu.Unlock()
+		n.queue <- BroadcastMsg{
+			payload,
+			dst,
 		}
 	}
+
+	return nil
 }
 
-func (n *Node) getNeighbours() []string {
-	if n.neighbours == nil {
-		ns := []string{}
-		for _, i := range n.NodeIDs() {
-			if i != n.ID() {
-				ns = append(ns, i)
-			}
-		}
-		n.neighbours = &ns
-	}
-	return *n.neighbours
-}
-
-func (n *Node) broadcastMessages() {
+func (n *Node) sendBroadcast() {
 	for {
 		msg := <-n.queue
-		go func(node *Node, m *BroadcastMsgs) {
-			resend := make(BroadcastMsgs)
+		go func(node *Node, m BroadcastMsg) {
 			// try to send a message from broadcast to neighbour nodes
-			for dst, payload := range *m {
-				if node.RPC(dst, payload, func(msg maelstrom.Message) error {
-					res := make(map[string]any)
-					err := json.Unmarshal(msg.Body, &res)
-					if err != nil || res["type"] != "broadcast_ok" {
-						node.queMu.Lock()
-						node.queue <- &BroadcastMsgs{
-							dst: payload,
-						}
-						node.queMu.Unlock()
+			if node.sendRPC(m) != nil {
+				for i := 0; i < MAX_RETRY; i++ {
+					if node.sendRPC(m) == nil {
+						break
 					}
-					return nil
-				}) != nil {
-					resend[dst] = payload
 				}
 			}
-			node.queMu.Lock()
-			node.queue <- &resend
-			node.queMu.Unlock()
 		}(n, msg)
 	}
+}
+
+func (n *Node) sendRPC(m BroadcastMsg) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*250)
+	defer cancel()
+	_, err := n.SyncRPC(ctx, m.Dst, m.Payload)
+	return err
 }
 
 // returns a new logger and a new log file in question, remember to close log file after the process exists
 func newLogger() (*log.Logger, *os.File) {
 	// because the logging get's too noisy when using with maelstrom
-	fileName := "/home/peke/Documents/code/distributed-systems-challenge/broadcast/logFile.log"
+	fileName := "/tmp/maelstrom.log"
 
 	// open log file
 	logFile, err := os.OpenFile(fileName, os.O_APPEND|os.O_RDWR|os.O_CREATE, 0644)
@@ -170,6 +114,10 @@ func newLogger() (*log.Logger, *os.File) {
 	return lg, logFile
 }
 
+func (n *Node) Keys() []float64 {
+	return n.store.Keys()
+}
+
 func main() {
 	lg, logFile = newLogger()
 	if logFile == nil {
@@ -180,7 +128,7 @@ func main() {
 	n := NewNode()
 
 	// handle messages to be sent to neighbour nodes
-	// go n.broadcastMessages()
+	go n.sendBroadcast()
 
 	// TODO Nodes should only return copies of their own local values?
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
@@ -189,8 +137,20 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &payload); err != nil {
 			return err
 		}
-
-		defer n.consumeBroadcast(msg, payload)
+		// n.storeMu.Lock()
+		if _, ok := n.store.Get(payload.Message); ok {
+			// n.storeMu.Unlock()
+			return n.Reply(msg, map[string]any{
+				"type": "broadcast_ok",
+			})
+		}
+		n.store.Set(payload.Message, struct{}{})
+		// n.store[val] = struct{}{}
+		// n.storeMu.Unlock()
+		if err := n.broadcastMessage(msg.Src, payload); err != nil {
+			return err
+		}
+		// defer n.consumeBroadcast(msg, payload)
 		// Echo the original message back with the updated message type.
 		return n.Reply(msg, map[string]any{
 			"type":   "broadcast_ok",
@@ -207,7 +167,7 @@ func main() {
 			body = make(map[string]any)
 		}
 		body["type"] = "read_ok"
-		body["messages"] = n.seen.Keys()
+		body["messages"] = n.Keys()
 		// body["messages"] a= n.values.Get()
 
 		return n.Reply(msg, body)
@@ -218,14 +178,16 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		if body == nil {
-			return n.Reply(msg, map[string]string{
-				"type": "topology_ok",
-			})
+		nbrs := body["topology"].(map[string]interface{})[n.ID()]
+		neighbors := []string{}
+		for _, nei := range nbrs.([]interface{}) {
+			neighbors = append(neighbors, nei.(string))
 		}
-		delete(body, "topology")
-		body["type"] = "topology_ok"
-		return n.Reply(msg, body)
+		n.neighbours = neighbors
+
+		return n.Reply(msg, map[string]string{
+			"type": "topology_ok",
+		})
 	})
 	if err := n.Run(); err != nil {
 		lg.Fatal(err)
